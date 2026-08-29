@@ -12,9 +12,7 @@ import androidx.compose.animation.core.animateTo
 import androidx.compose.animation.splineBasedDecay
 import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -40,11 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.roundToIntSize
 import androidx.compose.ui.unit.toOffset
 import androidx.compose.ui.util.lerp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.mapNotNull
-import kotlinx.coroutines.withContext
 import me.saket.telephoto.ExperimentalTelephotoApi
 import me.saket.telephoto.zoomable.ZoomableContentLocation.SameAsLayoutBounds
 import me.saket.telephoto.zoomable.internal.MutatePriorities
@@ -72,7 +66,6 @@ import me.saket.telephoto.zoomable.internal.times
 import me.saket.telephoto.zoomable.internal.unaryMinus
 import me.saket.telephoto.zoomable.internal.withOrigin
 import me.saket.telephoto.zoomable.internal.withZoomAndTranslate
-import me.saket.telephoto.zoomable.internal.zipWithPrevious
 import me.saket.telephoto.zoomable.internal.zoomedAndTranslatedBy
 import me.saket.telephoto.zoomable.spatial.CoordinateSpace
 import me.saket.telephoto.zoomable.spatial.SpatialOffset
@@ -239,8 +232,14 @@ internal class RealZoomableState internal constructor(
       "Can't transform with zoomDelta=$zoomDelta, panDelta=$panDelta, centroid=$centroid. ${collectDebugInfo()}"
     }
 
-    val lastGestureState = calculateGestureState() ?: return@TransformableState
+    val inputsWhenGestureBegan = currentGestureStateInputs ?: return@TransformableState
+    val lastGestureState = gestureState.calculate(inputsWhenGestureBegan)
     gestureState = GestureStateCalculator { inputs ->
+      // The content may have been resized since this gesture began.
+      val lastGestureState = lastGestureState.retainPanAcrossContentSizeChange(
+        from = inputsWhenGestureBegan,
+        to = inputs,
+      )
       val oldZoom = AbsoluteZoomFactor(
         baseZoom = inputs.baseZoom,
         userZoom = lastGestureState.userZoom,
@@ -596,11 +595,14 @@ internal class RealZoomableState internal constructor(
           )
         )
         // Note to self: skipping transformableState#transformBy(), since it enforces offset-locking.
-        gestureState = GestureStateCalculator {
+        gestureState = GestureStateCalculator { inputs ->
           startGestureState.copy(
             userOffset = animatedOffsetForUi.userOffset,
             userZoom = animatedZoom.userZoom,
             lastCentroid = centroidInViewport,
+          ).retainPanAcrossContentSizeChange(
+            from = gestureStateInputs,
+            to = inputs,
           )
         }
       }
@@ -676,36 +678,6 @@ internal class RealZoomableState internal constructor(
           }
         )
         previous = value
-      }
-    }
-  }
-
-  @Composable
-  fun RetainPanAcrossContentSizeChangesEffect() {
-    LaunchedEffect(this) {
-      withContext(Dispatchers.Main.immediate) { // To avoid flickers.
-        snapshotFlow { currentGestureStateInputs }
-          .mapNotNull { it?.unscaledContentBounds?.size }
-          .zipWithPrevious(::Pair)
-          .filter { (previous, current) ->
-            abs(current.aspectRatio() - previous.aspectRatio()) < ZoomDeltaEpsilon
-          }
-          .collect { (previous, current) ->
-            val scale = ScaleFactor(
-              scaleX = current.width / previous.width,
-              scaleY = current.height / previous.height,
-            )
-            // This unfortunately cancels any ongoing zoom/pan animations. It would be excellent
-            // to support updating the offset without interrupting animations in the future.
-            val currentGestureState = calculateGestureState()!!
-            transformableState.transform(MutatePriority.PreventUserInput) {
-              gestureState = GestureStateCalculator {
-                currentGestureState.copy(
-                  userOffset = currentGestureState.userOffset * scale
-                )
-              }
-            }
-          }
       }
     }
   }
@@ -821,6 +793,37 @@ internal data class GestureStateInputs(
   val layoutDirection: LayoutDirection,
   val zoomSpec: ZoomSpec,
 )
+
+/**
+ * Rescales [GestureState.userOffset] when the content is resized, say when a preview image is
+ * replaced by its full quality version. The offset lives in the content's coordinate space, so
+ * it would otherwise point at the wrong spot and make the content jump.
+ *
+ * Zoom needs no such fix-up because [UserZoomFactor] is a multiplier on top of [BaseZoomFactor],
+ * which is recalculated for the new size anyway.
+ *
+ * Content of a different aspect ratio is left alone. It's a different image, so there is nothing
+ * meaningful to map between the two.
+ */
+internal fun GestureState.retainPanAcrossContentSizeChange(
+  from: GestureStateInputs,
+  to: GestureStateInputs,
+): GestureState {
+  val oldSize = from.unscaledContentBounds.size
+  val newSize = to.unscaledContentBounds.size
+  if (oldSize == newSize || oldSize.isUnspecifiedOrEmpty || newSize.isUnspecifiedOrEmpty) {
+    return this
+  }
+  if (abs(newSize.aspectRatio() - oldSize.aspectRatio()) >= ZoomDeltaEpsilon) {
+    return this
+  }
+  return copy(
+    userOffset = userOffset * ScaleFactor(
+      scaleX = newSize.width / oldSize.width,
+      scaleY = newSize.height / oldSize.height,
+    )
+  )
+}
 
 @Immutable
 internal fun interface GestureStateCalculator {
